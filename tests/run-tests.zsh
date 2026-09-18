@@ -250,7 +250,7 @@ old_app_two='line'
 old_app="$old_app_one$old_app_two"
 users_directory='Users'
 absolute_user_prefix="/$users_directory/"
-if /usr/bin/grep -R -I -n -E "$forbidden_name|$old_app|$absolute_user_prefix" "$REPO_ROOT" >/dev/null; then
+if /usr/bin/grep -R -I -n --exclude-dir=.git -E "$forbidden_name|$old_app|$absolute_user_prefix" "$REPO_ROOT" >/dev/null; then
     fail "public hygiene scan found personal metadata"
 fi
 if /usr/bin/find "$REPO_ROOT/apps.d" -maxdepth 1 -type f -name '*.plist' | /usr/bin/grep -q .; then
