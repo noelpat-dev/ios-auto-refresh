@@ -1,0 +1,865 @@
+#!/bin/zsh
+
+set -u
+set -o pipefail
+umask 077
+
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+RAW_SCRIPT_PATH="$0"
+[[ "$RAW_SCRIPT_PATH" == /* ]] || RAW_SCRIPT_PATH="$PWD/$RAW_SCRIPT_PATH"
+case "$RAW_SCRIPT_PATH" in
+    *'/../'*|*/..)
+        print -u2 "The worker path must not contain traversal components."
+        exit 1
+        ;;
+esac
+raw_part=""
+for path_part in "${(@s:/:)RAW_SCRIPT_PATH}"; do
+    [[ -n "$path_part" ]] || continue
+    raw_part="$raw_part/$path_part"
+    if [[ -L "$raw_part" ]]; then
+        print -u2 "The worker path must not contain symlink components."
+        exit 1
+    fi
+done
+readonly RAW_SCRIPT_PATH
+readonly SCRIPT_PATH="${RAW_SCRIPT_PATH:A}"
+readonly DEFAULT_ROOT="$HOME/Library/Application Support/iOSAutoRefresh"
+readonly RUNTIME_ROOT="${IOS_AUTO_REFRESH_ROOT:-$DEFAULT_ROOT}"
+readonly CATALOG_DIR="${IOS_AUTO_REFRESH_CATALOG_DIR:-$RUNTIME_ROOT/catalog/apps.d}"
+
+APP_KEY=""
+TARGET_SCOPE=""
+MODE="run"
+TARGET_WAS_SET=0
+MODE_WAS_SET=0
+
+usage() {
+    print "Usage: $SCRIPT_PATH (--app <key>|--all) [--validate|--status|--dry-run|--force]"
+}
+
+while (( $# > 0 )); do
+    case "$1" in
+        --validate|--status|--dry-run|--force)
+            (( MODE_WAS_SET == 0 )) || {
+                print -u2 "Choose only one operating mode."
+                usage
+                exit 64
+            }
+            MODE="${1#--}"
+            MODE_WAS_SET=1
+            shift
+            ;;
+        --app)
+            (( $# >= 2 )) || { print -u2 -- "--app requires a catalog key."; usage; exit 64; }
+            (( TARGET_WAS_SET == 0 )) || {
+                print -u2 "Choose either --app <key> or --all, not both."
+                usage
+                exit 64
+            }
+            APP_KEY="$2"
+            TARGET_SCOPE="single"
+            TARGET_WAS_SET=1
+            shift 2
+            ;;
+        --all)
+            (( TARGET_WAS_SET == 0 )) || {
+                print -u2 "Choose either --app <key> or --all, not both."
+                usage
+                exit 64
+            }
+            TARGET_SCOPE="all"
+            TARGET_WAS_SET=1
+            shift
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            print -u2 "Unknown argument: $1"
+            usage
+            exit 64
+            ;;
+    esac
+done
+
+(( TARGET_WAS_SET == 1 )) || { print -u2 "Choose --app <key> or --all."; usage; exit 64; }
+
+timestamp() {
+    /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+log() {
+    print -r -- "$(timestamp) $*"
+}
+
+valid_regex() {
+    print -r -- "$1" | /usr/bin/grep -Eq "$2"
+}
+
+verify_installed_snapshot() {
+    local snapshot_dir="${SCRIPT_PATH:h}"
+    local expected_digest="${snapshot_dir:t}"
+    local actual_digest recorded_digest marker="$snapshot_dir/.snapshot-digest"
+
+    if [[ "${snapshot_dir:h}" != "$RUNTIME_ROOT/runtime" ]]; then
+        [[ ! -e "$marker" ]] || {
+            print -u2 "Runtime snapshot marker is outside the configured runtime root."
+            return 1
+        }
+        return 0
+    fi
+    valid_regex "$expected_digest" '^[0-9a-f]{64}$' || {
+        print -u2 "Installed runtime snapshot path is invalid."
+        return 1
+    }
+    [[ -f "$SCRIPT_PATH" && ! -L "$SCRIPT_PATH" && -f "$marker" && ! -L "$marker" ]] || {
+        print -u2 "Installed runtime snapshot files are invalid."
+        return 1
+    }
+    recorded_digest="$(<"$marker")"
+    [[ "$recorded_digest" == "$expected_digest" ]] || {
+        print -u2 "Installed runtime snapshot marker is invalid."
+        return 1
+    }
+    actual_digest="$(/usr/bin/shasum -a 256 "$SCRIPT_PATH" | /usr/bin/awk '{print $1}')"
+    [[ "$actual_digest" == "$expected_digest" ]] || {
+        print -u2 "Installed runtime snapshot failed its content hash. Reinstall before continuing."
+        return 1
+    }
+}
+
+verify_installed_snapshot || exit 1
+
+reject_symlink_components() {
+    local path="$1"
+    local part current=""
+    local -a parts
+
+    [[ "$path" == /* ]] || return 1
+    parts=("${(@s:/:)path}")
+    for part in "${parts[@]}"; do
+        [[ -n "$part" ]] || continue
+        current="$current/$part"
+        [[ ! -L "$current" ]] || return 1
+    done
+}
+
+owned_and_not_writable_by_others() {
+    local path="$1"
+    local owner mode
+    owner="$(/usr/bin/stat -f '%u' "$path" 2>/dev/null)" || return 1
+    mode="$(/usr/bin/stat -f '%Lp' "$path" 2>/dev/null)" || return 1
+    [[ "$owner" == "$(/usr/bin/id -u)" ]] || return 1
+    (( (8#$mode & 8#022) == 0 ))
+}
+
+catalog_keys() {
+    local config
+    for config in "$CATALOG_DIR"/*.plist(N); do
+        print -r -- "${config:t:r}"
+    done | /usr/bin/sort
+}
+
+validate_app_key() {
+    valid_regex "$1" '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$' || return 1
+    [[ "$1" != *..* ]]
+}
+
+load_app_config() {
+    local field value canonical_root
+
+    validate_app_key "$APP_KEY" || {
+        print -u2 "Invalid app catalog key: $APP_KEY"
+        return 64
+    }
+
+    [[ "$CATALOG_DIR" == /* && -d "$CATALOG_DIR" && ! -L "$CATALOG_DIR" ]] || {
+        print -u2 "Catalog directory must be an absolute, non-symlink directory."
+        return 64
+    }
+    reject_symlink_components "$CATALOG_DIR" || {
+        print -u2 "Catalog directory must not contain symlink components."
+        return 64
+    }
+    owned_and_not_writable_by_others "$CATALOG_DIR" || {
+        print -u2 "Catalog directory must be current-user-owned and not group/world writable."
+        return 64
+    }
+
+    APP_CONFIG="$CATALOG_DIR/$APP_KEY.plist"
+    [[ -f "$APP_CONFIG" && ! -L "$APP_CONFIG" ]] || {
+        print -u2 "Catalog entry must be a regular, non-symlink file: $APP_CONFIG"
+        return 64
+    }
+    owned_and_not_writable_by_others "$APP_CONFIG" || {
+        print -u2 "Catalog entry must be owned by the current user and not group/world writable: $APP_CONFIG"
+        return 64
+    }
+    /usr/bin/plutil -lint "$APP_CONFIG" >/dev/null || {
+        print -u2 "Malformed catalog entry: $APP_CONFIG"
+        return 64
+    }
+
+    for field in displayName projectRoot projectFile scheme configuration bundleIdentifier \
+        teamIdentifier buildDeviceUDID coreDeviceID refreshThresholdSeconds; do
+        value="$(/usr/bin/plutil -extract "$field" raw "$APP_CONFIG" 2>/dev/null || true)"
+        if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+            print -u2 "Catalog entry $APP_CONFIG has no valid value for $field."
+            return 64
+        fi
+        typeset "$field=$value"
+    done
+
+    [[ "$projectRoot" == /* && "$projectRoot" != *'/../'* && "$projectRoot" != */.. ]] || {
+        print -u2 "projectRoot must be an absolute traversal-free path."
+        return 64
+    }
+    [[ -d "$projectRoot" ]] || { print -u2 "projectRoot does not exist: $projectRoot"; return 64; }
+    reject_symlink_components "$projectRoot" || {
+        print -u2 "projectRoot must not contain symlink components."
+        return 64
+    }
+    owned_and_not_writable_by_others "$projectRoot" || {
+        print -u2 "projectRoot must be current-user-owned and not group/world writable."
+        return 64
+    }
+    canonical_root="$(cd "$projectRoot" 2>/dev/null && /bin/pwd -P)" || return 64
+    [[ "${projectRoot%/}" == "$canonical_root" ]] || {
+        print -u2 "projectRoot must already be canonical."
+        return 64
+    }
+
+    [[ "$projectFile" != */* && "$projectFile" != "." && "$projectFile" != ".." && "$projectFile" == *.xcodeproj ]] || {
+        print -u2 "projectFile must be one .xcodeproj directory name without path components."
+        return 64
+    }
+    PROJECT_PATH="$canonical_root/$projectFile"
+    [[ -d "$PROJECT_PATH" && ! -L "$PROJECT_PATH" ]] || {
+        print -u2 "projectFile must resolve to a non-symlink Xcode project directory below projectRoot."
+        return 64
+    }
+    owned_and_not_writable_by_others "$PROJECT_PATH" || {
+        print -u2 "projectFile must be current-user-owned and not group/world writable."
+        return 64
+    }
+
+    [[ "$scheme" != -* ]] || { print -u2 "scheme must not start with a hyphen."; return 64; }
+    [[ "$configuration" != -* && "$configuration" != */* && "$configuration" != "." && "$configuration" != ".." ]] || {
+        print -u2 "configuration contains an unsafe value."
+        return 64
+    }
+    valid_regex "$bundleIdentifier" '^[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)+$' || {
+        print -u2 "bundleIdentifier is invalid."
+        return 64
+    }
+    valid_regex "$teamIdentifier" '^[A-Z0-9]{10}$' || { print -u2 "teamIdentifier is invalid."; return 64; }
+    valid_regex "$buildDeviceUDID" '^[A-Fa-f0-9-]{8,64}$' || { print -u2 "buildDeviceUDID is invalid."; return 64; }
+    valid_regex "$coreDeviceID" '^[A-Fa-f0-9-]{8,64}$' || { print -u2 "coreDeviceID is invalid."; return 64; }
+    [[ "$refreshThresholdSeconds" == <-> ]] || { print -u2 "refreshThresholdSeconds must be a non-negative integer."; return 64; }
+
+    APP_DISPLAY_NAME="$displayName"
+    PROJECT_ROOT="$canonical_root"
+    PROJECT_FILE="$projectFile"
+    SCHEME="$scheme"
+    CONFIGURATION="$configuration"
+    BUNDLE_ID="$bundleIdentifier"
+    TEAM_ID="$teamIdentifier"
+    BUILD_DEVICE_UDID="$buildDeviceUDID"
+    CORE_DEVICE_ID="$coreDeviceID"
+    REFRESH_THRESHOLD_SECONDS="$refreshThresholdSeconds"
+
+    STATE_DIR="$RUNTIME_ROOT/state/$APP_KEY"
+    LOG_DIR="$RUNTIME_ROOT/logs/$APP_KEY"
+    DERIVED_DATA_DIR="$RUNTIME_ROOT/DerivedData/$APP_KEY"
+    RUNS_DIR="$RUNTIME_ROOT/runs"
+    STATE_PLIST="$STATE_DIR/state.plist"
+    LAST_RESULT_PLIST="$STATE_DIR/last-result.plist"
+    LOCK_DIR="$STATE_DIR/run.lock"
+    BUILD_LOG="$LOG_DIR/xcodebuild.log"
+    DEVICE_LOG="$LOG_DIR/devicectl.log"
+    PRODUCT_DIR="$DERIVED_DATA_DIR/Build/Products/$CONFIGURATION-iphoneos"
+}
+
+run_all() {
+    local key child_status aggregate_status=0
+    local -a keys child_args
+    keys=("${(@f)$(catalog_keys)}")
+    (( ${#keys} > 0 )) || { print -u2 "No catalog entries found in $CATALOG_DIR."; return 64; }
+
+    for key in "${keys[@]}"; do
+        IOS_AUTO_REFRESH_ROOT="$RUNTIME_ROOT" IOS_AUTO_REFRESH_CATALOG_DIR="$CATALOG_DIR" \
+            /bin/zsh "$SCRIPT_PATH" --app "$key" --validate >/dev/null || {
+                print -u2 "Catalog prevalidation failed for $key."
+                return 64
+            }
+    done
+
+    for key in "${keys[@]}"; do
+        child_args=(--app "$key")
+        [[ "$MODE" == "run" ]] || child_args+=("--$MODE")
+        print "=== $key ==="
+        IOS_AUTO_REFRESH_ROOT="$RUNTIME_ROOT" IOS_AUTO_REFRESH_CATALOG_DIR="$CATALOG_DIR" \
+            /bin/zsh "$SCRIPT_PATH" "${child_args[@]}"
+        child_status=$?
+        if (( child_status != 0 )); then
+            aggregate_status=1
+            print -u2 "$key failed with status $child_status; continuing."
+        fi
+    done
+    return "$aggregate_status"
+}
+
+if [[ "$TARGET_SCOPE" == "all" ]]; then
+    run_all
+    exit $?
+fi
+
+load_app_config || exit $?
+
+if [[ "$MODE" == "validate" ]]; then
+    print "$APP_KEY: configuration is valid."
+    exit 0
+fi
+
+iso_to_epoch() {
+    /bin/date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null
+}
+
+state_expiration() {
+    [[ -f "$STATE_PLIST" && ! -L "$STATE_PLIST" ]] || return 1
+    /usr/bin/plutil -extract profileExpirationUTC raw "$STATE_PLIST" 2>/dev/null
+}
+
+show_status() {
+    local expiration now_epoch expiration_epoch seconds_left
+    print "$APP_DISPLAY_NAME ($APP_KEY)"
+    print "Runtime root: $RUNTIME_ROOT"
+    if [[ -f "$LAST_RESULT_PLIST" && ! -L "$LAST_RESULT_PLIST" ]]; then
+        print "Last attempt: $(/usr/bin/plutil -extract lastAttemptUTC raw "$LAST_RESULT_PLIST" 2>/dev/null || print unknown)"
+        print "Last outcome: $(/usr/bin/plutil -extract outcome raw "$LAST_RESULT_PLIST" 2>/dev/null || print unknown)"
+    else
+        print "Last attempt: none recorded."
+    fi
+    expiration="$(state_expiration 2>/dev/null || true)"
+    if [[ -z "$expiration" ]]; then
+        print "No successful managed refresh is recorded."
+        return 0
+    fi
+    now_epoch="$(/bin/date -u '+%s')"
+    expiration_epoch="$(iso_to_epoch "$expiration" || true)"
+    [[ "$expiration_epoch" == <-> ]] || { print "Recorded expiration is invalid."; return 0; }
+    seconds_left=$(( expiration_epoch - now_epoch ))
+    print "Last managed profile expires: $expiration"
+    print "Seconds until expiry: $seconds_left"
+    print "Refresh threshold: $REFRESH_THRESHOLD_SECONDS seconds"
+}
+
+if [[ "$MODE" == "status" ]]; then
+    show_status
+    exit 0
+fi
+
+if [[ "$MODE" == "dry-run" ]]; then
+    recorded_expiration="$(state_expiration 2>/dev/null || true)"
+    if [[ -z "$recorded_expiration" ]]; then
+        log "Dry run: no successful managed refresh is recorded; $APP_DISPLAY_NAME would be refreshed."
+        exit 0
+    fi
+    now_epoch="$(/bin/date -u '+%s')"
+    due_epoch=$(( now_epoch + REFRESH_THRESHOLD_SECONDS ))
+    recorded_expiration_epoch="$(iso_to_epoch "$recorded_expiration" || true)"
+    if [[ "$recorded_expiration_epoch" == <-> ]] && (( recorded_expiration_epoch > due_epoch )); then
+        log "Dry run: $APP_DISPLAY_NAME is not due; the profile expires at $recorded_expiration."
+    else
+        log "Dry run: $APP_DISPLAY_NAME is due; the profile expires at $recorded_expiration."
+    fi
+    exit 0
+fi
+
+ensure_private_directory() {
+    local path="$1"
+    [[ "$path" == /* ]] || return 1
+    reject_symlink_components "$path" || return 1
+    /bin/mkdir -p "$path" || return 1
+    reject_symlink_components "$path" || return 1
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    [[ "$(/usr/bin/stat -f '%u' "$path" 2>/dev/null)" == "$(/usr/bin/id -u)" ]] || return 1
+    /bin/chmod 700 "$path"
+}
+
+for private_dir in "$RUNTIME_ROOT" "$RUNTIME_ROOT/state" "$RUNTIME_ROOT/logs" \
+    "$RUNTIME_ROOT/DerivedData" "$RUNS_DIR" "$STATE_DIR" "$LOG_DIR" "$DERIVED_DATA_DIR"; do
+    ensure_private_directory "$private_dir" || {
+        print -u2 "Unsafe or unavailable private runtime directory: $private_dir"
+        exit 1
+    }
+done
+
+if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    print -r -- "$$" > "$LOCK_DIR/pid"
+else
+    existing_pid=""
+    [[ -f "$LOCK_DIR/pid" && ! -L "$LOCK_DIR/pid" ]] && existing_pid="$(<"$LOCK_DIR/pid")"
+    if [[ "$existing_pid" == <-> ]] && /bin/kill -0 "$existing_pid" 2>/dev/null; then
+        log "Another refresh is already running for $APP_KEY; skipping."
+        exit 0
+    fi
+    if [[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" && -f "$LOCK_DIR/pid" && ! -L "$LOCK_DIR/pid" ]]; then
+        /bin/rm -f "$LOCK_DIR/pid" && /bin/rmdir "$LOCK_DIR" 2>/dev/null || {
+            print -u2 "Could not safely clear the stale lock."
+            exit 1
+        }
+        /bin/mkdir "$LOCK_DIR" || exit 1
+        print -r -- "$$" > "$LOCK_DIR/pid"
+    else
+        print -u2 "Refresh lock is unsafe or unreadable; refusing to continue."
+        exit 1
+    fi
+fi
+
+profile_source_directory() {
+    case "$1" in
+        xcode-user-data) print -r -- "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" ;;
+        mobile-device) print -r -- "$HOME/Library/MobileDevice/Provisioning Profiles" ;;
+        *) return 1 ;;
+    esac
+}
+
+recover_stale_runs() {
+    local stale_run profile_root source_key source_dir backup_dir backup original
+    local committed_marker
+    local -a replacement_candidates
+
+    for stale_run in "$RUNS_DIR/$APP_KEY".*(N/); do
+        [[ -d "$stale_run" && ! -L "$stale_run" ]] || return 1
+        owned_and_not_writable_by_others "$stale_run" || return 1
+        profile_root="$stale_run/profiles"
+        committed_marker="$stale_run/install-committed"
+        [[ ! -L "$committed_marker" ]] || return 1
+
+        if [[ -e "$profile_root" || -L "$profile_root" ]]; then
+            [[ -d "$profile_root" && ! -L "$profile_root" ]] || return 1
+            owned_and_not_writable_by_others "$profile_root" || return 1
+            for source_key in xcode-user-data mobile-device; do
+                source_dir="$(profile_source_directory "$source_key")" || return 1
+                backup_dir="$profile_root/$source_key"
+                [[ ! -e "$backup_dir" && ! -L "$backup_dir" ]] && continue
+                [[ -d "$backup_dir" && ! -L "$backup_dir" ]] || return 1
+                owned_and_not_writable_by_others "$backup_dir" || return 1
+
+                # A replacement means an earlier restoration was interrupted.
+                # Preserve every file and require manual inspection rather than
+                # guessing which profile should win.
+                replacement_candidates=("$backup_dir"/*.replacement(N.))
+                if (( ${#replacement_candidates} > 0 )); then
+                    print -u2 "A stale profile restoration needs manual recovery: $stale_run"
+                    return 1
+                fi
+
+                for backup in "$backup_dir"/*(N.); do
+                    [[ -f "$backup" && ! -L "$backup" ]] || return 1
+                    owned_and_not_writable_by_others "$backup" || return 1
+                    if [[ -f "$committed_marker" ]]; then
+                        /bin/rm -f "$backup" || return 1
+                        continue
+                    fi
+                    [[ -d "$source_dir" && ! -L "$source_dir" ]] || {
+                        print -u2 "Cannot restore a stale profile because its source directory is unavailable: $source_dir"
+                        return 1
+                    }
+                    reject_symlink_components "$source_dir" || return 1
+                    original="$source_dir/${backup:t}"
+                    if [[ -e "$original" || -L "$original" ]]; then
+                        print -u2 "A stale profile conflicts with an existing file; recovery was preserved at $stale_run"
+                        return 1
+                    fi
+                    /bin/mv "$backup" "$original" || return 1
+                done
+                /bin/rmdir "$backup_dir" 2>/dev/null || return 1
+            done
+            /bin/rmdir "$profile_root" 2>/dev/null || return 1
+        fi
+
+        /bin/rm -f "$committed_marker" "$stale_run/device-apps.json" \
+            "$stale_run/device-processes.json" "$stale_run/device-processes.plist" \
+            "$stale_run/decoded-profile.plist"
+        /bin/rmdir "$stale_run" 2>/dev/null || {
+            print -u2 "A stale run contains unexpected recovery data: $stale_run"
+            return 1
+        }
+    done
+}
+
+if ! recover_stale_runs; then
+    print -u2 "A previous interrupted profile quarantine needs manual recovery."
+    /bin/rm -f "$LOCK_DIR/pid"
+    /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+    exit 1
+fi
+
+recorded_expiration="$(state_expiration 2>/dev/null || true)"
+now_epoch="$(/bin/date -u '+%s')"
+due_epoch=$(( now_epoch + REFRESH_THRESHOLD_SECONDS ))
+recorded_expiration_epoch="$(iso_to_epoch "$recorded_expiration" || true)"
+if [[ "$MODE" != "force" && "$recorded_expiration_epoch" == <-> ]] && (( recorded_expiration_epoch > due_epoch )); then
+    log "$APP_DISPLAY_NAME is not due; the profile expires at $recorded_expiration."
+    /bin/rm -f "$LOCK_DIR/pid"
+    /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+    exit 0
+fi
+
+RUN_DIR="$(/usr/bin/mktemp -d "$RUNS_DIR/$APP_KEY.XXXXXXXX")" || {
+    /bin/rm -f "$LOCK_DIR/pid"
+    /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+    exit 1
+}
+/bin/chmod 700 "$RUN_DIR"
+QUARANTINE_DIR="$RUN_DIR/profiles"
+if ! /bin/mkdir "$QUARANTINE_DIR" || ! /bin/chmod 700 "$QUARANTINE_DIR"; then
+    /bin/rmdir "$RUN_DIR" 2>/dev/null || true
+    /bin/rm -f "$LOCK_DIR/pid"
+    /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+    exit 1
+fi
+DEVICE_APPS_JSON="$RUN_DIR/device-apps.json"
+DEVICE_PROCESSES_JSON="$RUN_DIR/device-processes.json"
+DEVICE_PROCESSES_PLIST="$RUN_DIR/device-processes.plist"
+DECODED_PROFILE="$RUN_DIR/decoded-profile.plist"
+STATE_TMP=""
+ATTEMPT_OUTCOME="in_progress"
+ATTEMPT_MESSAGE="Refresh did not reach a final result."
+INSTALL_COMMITTED=0
+typeset -a QUARANTINED_ORIGINALS QUARANTINED_BACKUPS
+
+prepare_private_log() {
+    local path="$1"
+    [[ ! -L "$path" ]] || return 1
+    if [[ -e "$path" ]]; then
+        [[ -f "$path" ]] || return 1
+        owned_and_not_writable_by_others "$path" || return 1
+    else
+        : > "$path" || return 1
+    fi
+    /bin/chmod 600 "$path" || return 1
+    : > "$path"
+}
+
+cap_log() {
+    local path="$1" size temporary
+    [[ ! -e "$path" && ! -L "$path" ]] && return 0
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    size="$(/usr/bin/stat -f '%z' "$path" 2>/dev/null)" || return 1
+    [[ "$size" == <-> ]] || return 1
+    (( size <= 1048576 )) && return 0
+    temporary="$(/usr/bin/mktemp "$LOG_DIR/.log.XXXXXXXX")" || return 1
+    /usr/bin/tail -c 1048576 "$path" > "$temporary" 2>/dev/null || {
+        /bin/rm -f "$temporary"
+        return 1
+    }
+    /bin/chmod 600 "$temporary" || { /bin/rm -f "$temporary"; return 1; }
+    /bin/mv -f "$temporary" "$path" || { /bin/rm -f "$temporary"; return 1; }
+}
+
+prepare_private_log "$BUILD_LOG" && prepare_private_log "$DEVICE_LOG" || {
+    print -u2 "Diagnostic log paths are unsafe; refusing to continue."
+    /bin/rmdir "$QUARANTINE_DIR" 2>/dev/null || true
+    /bin/rmdir "$RUN_DIR" 2>/dev/null || true
+    /bin/rm -f "$LOCK_DIR/pid"
+    /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+    exit 1
+}
+
+record_result() {
+    local tmp
+    tmp="$(/usr/bin/mktemp "$STATE_DIR/last-result.plist.XXXXXXXX")" || return 0
+    /usr/bin/plutil -create xml1 "$tmp" &&
+        /usr/bin/plutil -insert lastAttemptUTC -string "$(timestamp)" "$tmp" &&
+        /usr/bin/plutil -insert outcome -string "$ATTEMPT_OUTCOME" "$tmp" &&
+        /usr/bin/plutil -insert message -string "$ATTEMPT_MESSAGE" "$tmp" &&
+        /bin/chmod 600 "$tmp" &&
+        /bin/mv -f "$tmp" "$LAST_RESULT_PLIST" || /bin/rm -f "$tmp"
+}
+
+cleanup() {
+    local status=$?
+    local index original backup replacement
+
+    for (( index = 1; index <= ${#QUARANTINED_ORIGINALS}; index++ )); do
+        original="${QUARANTINED_ORIGINALS[$index]}"
+        backup="${QUARANTINED_BACKUPS[$index]}"
+        replacement="$backup.replacement"
+        if (( INSTALL_COMMITTED == 0 )) && [[ -f "$backup" ]]; then
+            if [[ -e "$original" ]]; then
+                if ! /bin/mv "$original" "$replacement" 2>/dev/null; then
+                    log "Could not preserve a replacement profile; the original backup remains in $QUARANTINE_DIR."
+                    continue
+                fi
+            fi
+            if /bin/mv "$backup" "$original" 2>/dev/null; then
+                /bin/rm -f "$replacement"
+            else
+                log "Could not restore a quarantined profile; recovery files remain in $QUARANTINE_DIR."
+                continue
+            fi
+        fi
+        /bin/rm -f "$backup" "$replacement"
+    done
+
+    [[ -n "$STATE_TMP" ]] && /bin/rm -f "$STATE_TMP"
+    /bin/rm -f "$DEVICE_APPS_JSON" "$DEVICE_PROCESSES_JSON" "$DEVICE_PROCESSES_PLIST" "$DECODED_PROFILE"
+    /bin/rmdir "$QUARANTINE_DIR/xcode-user-data" "$QUARANTINE_DIR/mobile-device" 2>/dev/null || true
+    /bin/rmdir "$QUARANTINE_DIR" 2>/dev/null || true
+    /bin/rm -f "$RUN_DIR/install-committed"
+    /bin/rmdir "$RUN_DIR" 2>/dev/null || true
+    if ! cap_log "$BUILD_LOG" || ! cap_log "$DEVICE_LOG"; then
+        ATTEMPT_OUTCOME="diagnostic_retention_failed"
+        ATTEMPT_MESSAGE="The refresh finished, but a diagnostic log could not be safely capped."
+        status=1
+    fi
+    record_result
+    /bin/rm -f "$LOCK_DIR/pid"
+    /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+    return "$status"
+}
+trap cleanup EXIT
+
+abort_on_signal() {
+    set_result "interrupted" "The refresh was interrupted; quarantined profiles will be restored."
+    trap - HUP INT TERM
+    exit 130
+}
+trap abort_on_signal HUP INT TERM
+
+set_result() {
+    ATTEMPT_OUTCOME="$1"
+    ATTEMPT_MESSAGE="$2"
+}
+
+profile_value() {
+    local profile="$1" key="$2"
+    /usr/bin/security cms -D -i "$profile" > "$DECODED_PROFILE" 2>/dev/null || return 1
+    /usr/bin/plutil -extract "$key" raw "$DECODED_PROFILE" 2>/dev/null
+}
+
+preflight_succeeded=0
+for preflight_attempt in 1 2 3; do
+    /bin/rm -f "$DEVICE_APPS_JSON"
+    if /usr/bin/xcrun devicectl device info apps \
+        --device "$CORE_DEVICE_ID" --bundle-id "$BUNDLE_ID" --timeout 30 \
+        --json-output "$DEVICE_APPS_JSON" --quiet >>"$DEVICE_LOG" 2>&1; then
+        preflight_succeeded=1
+        break
+    fi
+    (( preflight_attempt < 3 )) && /bin/sleep 5
+done
+
+if (( preflight_succeeded == 0 )); then
+    set_result "device_unreachable" "The configured device could not be reached; no app or profile was changed."
+    log "$ATTEMPT_MESSAGE"
+    exit 1
+fi
+
+installed_bundle_id="$(/usr/bin/plutil -extract result.apps.0.bundleIdentifier raw "$DEVICE_APPS_JSON" 2>/dev/null || true)"
+if [[ "$installed_bundle_id" != "$BUNDLE_ID" ]]; then
+    set_result "app_missing" "The configured app is not installed; refusing a first install."
+    log "$ATTEMPT_MESSAGE"
+    exit 1
+fi
+
+quarantine_due_profiles() {
+    local source_key profile_dir backup_dir profile application_id expiration expiration_epoch backup
+    local expected_application_id="$TEAM_ID.$BUNDLE_ID"
+
+    for source_key in xcode-user-data mobile-device; do
+        profile_dir="$(profile_source_directory "$source_key")" || return 1
+        [[ -d "$profile_dir" && ! -L "$profile_dir" ]] || continue
+        reject_symlink_components "$profile_dir" || return 1
+        backup_dir="$QUARANTINE_DIR/$source_key"
+        while IFS= read -r -d '' profile; do
+            [[ -f "$profile" && ! -L "$profile" ]] || continue
+            application_id="$(profile_value "$profile" 'Entitlements.application-identifier' || true)"
+            [[ "$application_id" == "$expected_application_id" ]] || continue
+            expiration="$(profile_value "$profile" 'ExpirationDate' || true)"
+            expiration_epoch="$(iso_to_epoch "$expiration" || true)"
+            [[ "$expiration_epoch" == <-> ]] || continue
+            if [[ "$MODE" != "force" ]] && (( expiration_epoch > due_epoch )); then
+                continue
+            fi
+            if [[ ! -d "$backup_dir" ]]; then
+                /bin/mkdir "$backup_dir" && /bin/chmod 700 "$backup_dir" || return 1
+            fi
+            backup="$backup_dir/${profile:t}"
+            [[ ! -e "$backup" && ! -L "$backup" ]] || return 1
+            /bin/mv "$profile" "$backup" || return 1
+            QUARANTINED_ORIGINALS+=("$profile")
+            QUARANTINED_BACKUPS+=("$backup")
+        done < <(/usr/bin/find "$profile_dir" -maxdepth 1 -type f \( -name '*.mobileprovision' -o -name '*.provisionprofile' \) -print0)
+    done
+}
+
+if ! quarantine_due_profiles; then
+    set_result "profile_quarantine_failed" "A matching cached profile could not be quarantined safely."
+    exit 1
+fi
+
+log "Building a freshly signed $APP_DISPLAY_NAME app."
+if ! /usr/bin/xcodebuild \
+    -project "$PROJECT_PATH" -scheme "$SCHEME" -configuration "$CONFIGURATION" \
+    -destination "id=$BUILD_DEVICE_UDID" -destination-timeout 30 \
+    -derivedDataPath "$DERIVED_DATA_DIR" -allowProvisioningUpdates clean build \
+    CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM="$TEAM_ID" COMPILER_INDEX_STORE_ENABLE=NO \
+    >"$BUILD_LOG" 2>&1; then
+    set_result "build_failed" "Xcode build or automatic signing failed; the installed app was not changed."
+    log "$ATTEMPT_MESSAGE"
+    exit 1
+fi
+
+typeset -a built_candidates
+built_candidates=()
+while IFS= read -r -d '' candidate; do
+    candidate_bundle_id="$(/usr/bin/plutil -extract CFBundleIdentifier raw "$candidate/Info.plist" 2>/dev/null || true)"
+    [[ "$candidate_bundle_id" == "$BUNDLE_ID" ]] && built_candidates+=("$candidate")
+done < <(/usr/bin/find "$PRODUCT_DIR" -type d -name '*.app' -prune -print0 2>/dev/null)
+
+if (( ${#built_candidates} != 1 )); then
+    set_result "product_invalid" "The build did not produce exactly one matching app bundle."
+    exit 1
+fi
+
+APP_PATH="${built_candidates[1]}"
+EMBEDDED_PROFILE="$APP_PATH/embedded.mobileprovision"
+[[ -d "$APP_PATH" && ! -L "$APP_PATH" && -f "$APP_PATH/Info.plist" && ! -L "$APP_PATH/Info.plist" && -f "$EMBEDDED_PROFILE" && ! -L "$EMBEDDED_PROFILE" ]] || {
+    set_result "product_invalid" "The matching app bundle or embedded profile is unsafe or missing."
+    exit 1
+}
+
+built_bundle_id="$(/usr/bin/plutil -extract CFBundleIdentifier raw "$APP_PATH/Info.plist" 2>/dev/null || true)"
+built_executable="$(/usr/bin/plutil -extract CFBundleExecutable raw "$APP_PATH/Info.plist" 2>/dev/null || true)"
+built_application_id="$(profile_value "$EMBEDDED_PROFILE" 'Entitlements.application-identifier' || true)"
+built_team_id="$(profile_value "$EMBEDDED_PROFILE" 'TeamIdentifier.0' || true)"
+built_expiration="$(profile_value "$EMBEDDED_PROFILE" 'ExpirationDate' || true)"
+built_expiration_epoch="$(iso_to_epoch "$built_expiration" || true)"
+
+if [[ "$built_bundle_id" != "$BUNDLE_ID" || "$built_application_id" != "$TEAM_ID.$BUNDLE_ID" || "$built_team_id" != "$TEAM_ID" ]]; then
+    set_result "identity_mismatch" "The signed product identity does not match the catalog."
+    exit 1
+fi
+valid_regex "$built_executable" '^[A-Za-z0-9._+ -]{1,255}$' || {
+    set_result "product_invalid" "The built executable name is unsafe."
+    exit 1
+}
+[[ -f "$APP_PATH/$built_executable" && ! -L "$APP_PATH/$built_executable" ]] || {
+    set_result "product_invalid" "The built executable is missing or unsafe."
+    exit 1
+}
+if [[ "$built_expiration_epoch" != <-> ]] || (( built_expiration_epoch <= due_epoch )); then
+    set_result "profile_too_short" "Xcode did not produce a profile valid beyond the refresh threshold."
+    exit 1
+fi
+if ! /usr/bin/codesign --verify --deep --strict "$APP_PATH" >>"$BUILD_LOG" 2>&1; then
+    set_result "signature_invalid" "The built app failed strict code-signature verification."
+    exit 1
+fi
+
+process_marker="/${APP_PATH:t}/$built_executable"
+check_running_state() {
+    PROCESS_STATE="error"
+    /bin/rm -f "$DEVICE_PROCESSES_JSON" "$DEVICE_PROCESSES_PLIST"
+    if ! /usr/bin/xcrun devicectl device info processes \
+        --device "$CORE_DEVICE_ID" --timeout 30 --json-output "$DEVICE_PROCESSES_JSON" \
+        --quiet >>"$DEVICE_LOG" 2>&1; then
+        return 0
+    fi
+    if ! /usr/bin/plutil -convert xml1 -o "$DEVICE_PROCESSES_PLIST" "$DEVICE_PROCESSES_JSON" 2>>"$DEVICE_LOG"; then
+        return 0
+    fi
+    if /usr/bin/grep -Fq "$process_marker</string>" "$DEVICE_PROCESSES_PLIST"; then
+        PROCESS_STATE="running"
+    else
+        PROCESS_STATE="stopped"
+    fi
+}
+
+check_running_state
+case "$PROCESS_STATE" in
+    running)
+        set_result "app_running" "The app is running; it was left uninterrupted."
+        log "$ATTEMPT_MESSAGE"
+        exit 0
+        ;;
+    stopped) ;;
+    *)
+        set_result "device_unreachable" "The app running state could not be checked; installation was refused."
+        exit 1
+        ;;
+esac
+
+# Recheck the exact artifact immediately before the only device mutation.
+if ! /usr/bin/codesign --verify --deep --strict "$APP_PATH" >>"$BUILD_LOG" 2>&1; then
+    set_result "signature_invalid" "The app changed after validation; installation was refused."
+    exit 1
+fi
+
+# Minimize the unavoidable device-state race by checking again immediately
+# before the install command.
+check_running_state
+case "$PROCESS_STATE" in
+    running)
+        set_result "app_running" "The app started running before installation; it was left uninterrupted."
+        log "$ATTEMPT_MESSAGE"
+        exit 0
+        ;;
+    stopped) ;;
+    *)
+        set_result "device_unreachable" "The final running-state check failed; installation was refused."
+        exit 1
+        ;;
+esac
+
+log "Installing $APP_DISPLAY_NAME in place."
+if ! /usr/bin/xcrun devicectl device install app \
+    --device "$CORE_DEVICE_ID" --timeout 120 "$APP_PATH" >"$DEVICE_LOG" 2>&1; then
+    set_result "install_failed" "The in-place installation failed; the previous app remains installed."
+    exit 1
+fi
+
+/bin/rm -f "$DEVICE_APPS_JSON"
+if ! /usr/bin/xcrun devicectl device info apps \
+    --device "$CORE_DEVICE_ID" --bundle-id "$BUNDLE_ID" --timeout 30 \
+    --json-output "$DEVICE_APPS_JSON" --quiet >>"$DEVICE_LOG" 2>&1; then
+    set_result "post_install_check_failed" "Installation returned success but post-install verification failed."
+    exit 1
+fi
+installed_bundle_id="$(/usr/bin/plutil -extract result.apps.0.bundleIdentifier raw "$DEVICE_APPS_JSON" 2>/dev/null || true)"
+[[ "$installed_bundle_id" == "$BUNDLE_ID" ]] || {
+    set_result "post_install_check_failed" "The matching app was not visible after installation."
+    exit 1
+}
+
+STATE_TMP="$(/usr/bin/mktemp "$STATE_DIR/state.plist.XXXXXXXX")" || exit 1
+if ! {
+    /usr/bin/plutil -create xml1 "$STATE_TMP" &&
+    /usr/bin/plutil -insert lastSuccessfulInstallUTC -string "$(timestamp)" "$STATE_TMP" &&
+    /usr/bin/plutil -insert profileExpirationUTC -string "$built_expiration" "$STATE_TMP" &&
+    /bin/chmod 600 "$STATE_TMP" &&
+    /usr/bin/plutil -lint "$STATE_TMP" >/dev/null &&
+    /bin/mv -f "$STATE_TMP" "$STATE_PLIST"
+}; then
+    set_result "state_write_failed" "The app installed, but minimal state could not be recorded."
+    exit 1
+fi
+STATE_TMP=""
+print -r -- "committed" > "$RUN_DIR/install-committed" || {
+    set_result "state_write_failed" "The app installed, but its recovery marker could not be recorded."
+    exit 1
+}
+/bin/chmod 600 "$RUN_DIR/install-committed" || {
+    set_result "state_write_failed" "The app installed, but its recovery marker could not be secured."
+    exit 1
+}
+INSTALL_COMMITTED=1
+set_result "success" "The in-place refresh succeeded."
+log "$APP_DISPLAY_NAME refresh succeeded; the profile expires at $built_expiration."

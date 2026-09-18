@@ -1,0 +1,53 @@
+#!/bin/zsh
+
+set -eu
+umask 077
+
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+readonly LABEL="dev.ios-auto-refresh"
+readonly DESTINATION_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+readonly DOMAIN="gui/$(/usr/bin/id -u)"
+readonly LAUNCHCTL="${IOS_AUTO_REFRESH_LAUNCHCTL:-/bin/launchctl}"
+
+[[ "$LAUNCHCTL" == /* && -x "$LAUNCHCTL" && ! -L "$LAUNCHCTL" ]] || {
+    print -u2 "launchctl path is unsafe or unavailable."
+    exit 1
+}
+launchctl_owner="$(/usr/bin/stat -f '%u' "$LAUNCHCTL")"
+launchctl_mode="$(/usr/bin/stat -f '%Lp' "$LAUNCHCTL")"
+[[ "$launchctl_owner" == 0 || "$launchctl_owner" == "$(/usr/bin/id -u)" ]] || {
+    print -u2 "launchctl must be owned by root or the current user."
+    exit 1
+}
+(( (8#$launchctl_mode & 8#022) == 0 )) || {
+    print -u2 "launchctl must not be group/world writable."
+    exit 1
+}
+
+if "$LAUNCHCTL" print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    if ! "$LAUNCHCTL" bootout "$DOMAIN/$LABEL"; then
+        print -u2 "Could not unload the LaunchAgent; its plist was left in place."
+        exit 1
+    fi
+    if "$LAUNCHCTL" print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+        print -u2 "The LaunchAgent still appears loaded; its plist was left in place."
+        exit 1
+    fi
+fi
+
+if [[ -f "$DESTINATION_PLIST" && ! -L "$DESTINATION_PLIST" ]]; then
+    /bin/mkdir -p "$HOME/.Trash"
+    suffix=0
+    trash_path="$HOME/.Trash/$LABEL.$(/bin/date -u '+%Y%m%dT%H%M%SZ').plist"
+    while [[ -e "$trash_path" ]]; do
+        suffix=$(( suffix + 1 ))
+        trash_path="$HOME/.Trash/$LABEL.$(/bin/date -u '+%Y%m%dT%H%M%SZ').$suffix.plist"
+    done
+    /bin/mv "$DESTINATION_PLIST" "$trash_path"
+    print "LaunchAgent moved to Trash: $trash_path"
+else
+    print "No installed LaunchAgent plist was found."
+fi
+
+print "Catalogs, state, diagnostics, runtime snapshots, installed apps, and app data were preserved."

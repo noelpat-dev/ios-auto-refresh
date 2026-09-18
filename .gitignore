@@ -1,0 +1,17 @@
+.DS_Store
+*.swp
+
+# App catalogs contain local paths and deployment identifiers.
+apps.d/*.plist
+!apps.d/*.plist.template
+
+# Signing material and generated build output must never be committed.
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.p8
+*.pem
+*.cer
+DerivedData/
+build/
+*.xcresult

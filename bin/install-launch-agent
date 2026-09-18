@@ -1,0 +1,278 @@
+#!/bin/zsh
+
+set -eu
+set -o pipefail
+umask 077
+
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+readonly SCRIPT_DIR="${0:A:h}"
+readonly SOURCE_ROOT="${SCRIPT_DIR:h}"
+readonly SOURCE_WORKER="$SCRIPT_DIR/ios-auto-refresh"
+readonly SOURCE_CATALOG="${IOS_AUTO_REFRESH_SOURCE_CATALOG_DIR:-$SOURCE_ROOT/apps.d}"
+readonly LABEL="dev.ios-auto-refresh"
+readonly INSTALL_ROOT="$HOME/Library/Application Support/iOSAutoRefresh"
+readonly RUNTIME_ROOT="$INSTALL_ROOT/runtime"
+readonly CATALOG_PARENT="$INSTALL_ROOT/catalog"
+readonly INSTALLED_CATALOG="$CATALOG_PARENT/apps.d"
+readonly DESTINATION_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+readonly DOMAIN="gui/$(/usr/bin/id -u)"
+readonly LAUNCHCTL="/bin/launchctl"
+
+DRY_RUN=0
+NO_LOAD=0
+
+reject_symlink_components() {
+    local path="$1" part current=""
+    local -a parts
+    [[ "$path" == /* ]] || return 1
+    parts=("${(@s:/:)path}")
+    for part in "${parts[@]}"; do
+        [[ -n "$part" ]] || continue
+        current="$current/$part"
+        [[ ! -L "$current" ]] || return 1
+    done
+}
+
+owned_and_not_writable_by_others() {
+    local path="$1" owner mode
+    owner="$(/usr/bin/stat -f '%u' "$path" 2>/dev/null)" || return 1
+    mode="$(/usr/bin/stat -f '%Lp' "$path" 2>/dev/null)" || return 1
+    [[ "$owner" == "$(/usr/bin/id -u)" ]] || return 1
+    (( (8#$mode & 8#022) == 0 ))
+}
+if (( $# > 1 )); then
+    print -u2 "Usage: $0 [--dry-run|--no-load]"
+    exit 64
+fi
+if (( $# == 1 )); then
+    case "$1" in
+        --dry-run) DRY_RUN=1 ;;
+        --no-load) NO_LOAD=1 ;;
+        *) print -u2 "Usage: $0 [--dry-run|--no-load]"; exit 64 ;;
+    esac
+fi
+
+[[ -f "$SOURCE_WORKER" && ! -L "$SOURCE_WORKER" ]] || {
+    print -u2 "Worker must be a regular, non-symlink file: $SOURCE_WORKER"
+    exit 64
+}
+[[ "$(/usr/bin/stat -f '%u' "$SOURCE_WORKER")" == "$(/usr/bin/id -u)" ]] || {
+    print -u2 "Worker must be owned by the current user."
+    exit 64
+}
+worker_mode="$(/usr/bin/stat -f '%Lp' "$SOURCE_WORKER")"
+(( (8#$worker_mode & 8#022) == 0 )) || {
+    print -u2 "Worker must not be group/world writable."
+    exit 64
+}
+
+[[ -d "$SOURCE_CATALOG" && ! -L "$SOURCE_CATALOG" ]] || {
+    print -u2 "Source catalog must be a non-symlink directory: $SOURCE_CATALOG"
+    exit 64
+}
+reject_symlink_components "$SOURCE_CATALOG" && owned_and_not_writable_by_others "$SOURCE_CATALOG" || {
+    print -u2 "Source catalog must be current-user-owned, traversal-free, and not group/world writable."
+    exit 64
+}
+
+typeset -a app_plists
+app_plists=("$SOURCE_CATALOG"/*.plist(N))
+(( ${#app_plists} > 0 )) || {
+    print -u2 "No real app catalogs found. Copy apps.d/example.plist.template to apps.d/<key>.plist and configure it first."
+    exit 64
+}
+
+for app_plist in "${app_plists[@]}"; do
+    app_key="${app_plist:t:r}"
+    IOS_AUTO_REFRESH_ROOT="$INSTALL_ROOT" IOS_AUTO_REFRESH_CATALOG_DIR="$SOURCE_CATALOG" \
+        /bin/zsh "$SOURCE_WORKER" --app "$app_key" --validate >/dev/null || {
+            print -u2 "Catalog validation failed: $app_plist"
+            exit 64
+        }
+done
+
+worker_digest="$(/usr/bin/shasum -a 256 "$SOURCE_WORKER" | /usr/bin/awk '{print $1}')"
+print -r -- "$worker_digest" | /usr/bin/grep -Eq '^[0-9a-f]{64}$' || {
+    print -u2 "Could not hash the worker."
+    exit 1
+}
+readonly FINAL_RUNTIME="$RUNTIME_ROOT/$worker_digest"
+readonly INSTALLED_WORKER="$FINAL_RUNTIME/ios-auto-refresh"
+
+if (( DRY_RUN == 1 )); then
+    print "Dry run: ${#app_plists} catalog entry or entries validated."
+    print "Dry run: worker snapshot would be $FINAL_RUNTIME"
+    print "Dry run: LaunchAgent would be $DESTINATION_PLIST"
+    print "Dry run: no files were written and launchctl was not invoked."
+    exit 0
+fi
+
+for directory in "$INSTALL_ROOT" "$RUNTIME_ROOT" "$CATALOG_PARENT" \
+    "$INSTALL_ROOT/state" "$INSTALL_ROOT/logs" "$INSTALL_ROOT/DerivedData" "$INSTALL_ROOT/runs" \
+    "$HOME/Library/LaunchAgents"; do
+    [[ ! -L "$directory" ]] || { print -u2 "Refusing symlink directory: $directory"; exit 1; }
+    /bin/mkdir -p "$directory"
+done
+/bin/chmod 700 "$INSTALL_ROOT" "$RUNTIME_ROOT" "$CATALOG_PARENT" \
+    "$INSTALL_ROOT/state" "$INSTALL_ROOT/logs" "$INSTALL_ROOT/DerivedData" "$INSTALL_ROOT/runs"
+
+if [[ -e "$INSTALLED_CATALOG" || -L "$INSTALLED_CATALOG" ]]; then
+    [[ -d "$INSTALLED_CATALOG" && ! -L "$INSTALLED_CATALOG" ]] || {
+        print -u2 "Installed catalog path is unsafe: $INSTALLED_CATALOG"
+        exit 1
+    }
+    owned_and_not_writable_by_others "$INSTALLED_CATALOG" || {
+        print -u2 "Installed catalog must be current-user-owned and not group/world writable."
+        exit 1
+    }
+    for installed_plist in "$INSTALLED_CATALOG"/*.plist(N); do
+        if [[ ! -f "$SOURCE_CATALOG/${installed_plist:t}" ]]; then
+            print -u2 "Installed catalog entry has no matching source entry: $installed_plist"
+            print -u2 "Move that stale entry aside explicitly before reinstalling."
+            exit 1
+        fi
+    done
+fi
+
+if [[ ! -e "$FINAL_RUNTIME" && ! -L "$FINAL_RUNTIME" ]]; then
+    staging="$(/usr/bin/mktemp -d "$RUNTIME_ROOT/.staging.XXXXXXXX")"
+    trap '/bin/rm -f "$staging/ios-auto-refresh" "$staging/.snapshot-digest"; /bin/rmdir "$staging" 2>/dev/null || true' EXIT
+    /bin/cp "$SOURCE_WORKER" "$staging/ios-auto-refresh"
+    /bin/chmod 700 "$staging/ios-auto-refresh"
+    staged_digest="$(/usr/bin/shasum -a 256 "$staging/ios-auto-refresh" | /usr/bin/awk '{print $1}')"
+    [[ "$staged_digest" == "$worker_digest" ]] || { print -u2 "Worker changed while being staged."; exit 1; }
+    print -r -- "$worker_digest" > "$staging/.snapshot-digest"
+    /bin/chmod 600 "$staging/.snapshot-digest"
+    /bin/mv "$staging" "$FINAL_RUNTIME"
+    trap - EXIT
+else
+    [[ -d "$FINAL_RUNTIME" && ! -L "$FINAL_RUNTIME" && -f "$INSTALLED_WORKER" && ! -L "$INSTALLED_WORKER" && -f "$FINAL_RUNTIME/.snapshot-digest" && ! -L "$FINAL_RUNTIME/.snapshot-digest" ]] || {
+        print -u2 "Existing runtime snapshot is invalid."
+        exit 1
+    }
+    installed_digest="$(/usr/bin/shasum -a 256 "$INSTALLED_WORKER" | /usr/bin/awk '{print $1}')"
+    recorded_digest="$(<"$FINAL_RUNTIME/.snapshot-digest")"
+    [[ "$installed_digest" == "$worker_digest" && "$recorded_digest" == "$worker_digest" ]] || {
+        print -u2 "Existing runtime snapshot failed its content hash."
+        exit 1
+    }
+fi
+
+CATALOG_STAGING="$(/usr/bin/mktemp -d "$CATALOG_PARENT/.apps.d.staging.XXXXXXXX")"
+CATALOG_BACKUP=""
+/bin/chmod 700 "$CATALOG_STAGING"
+cleanup_catalog_transaction() {
+    local item
+    if [[ -n "$CATALOG_STAGING" && -d "$CATALOG_STAGING" && ! -L "$CATALOG_STAGING" ]]; then
+        for item in "$CATALOG_STAGING"/*(N); do
+            [[ -f "$item" && ! -L "$item" ]] && /bin/rm -f "$item"
+        done
+        /bin/rmdir "$CATALOG_STAGING" 2>/dev/null || true
+    fi
+    if [[ -n "$CATALOG_BACKUP" && ! -e "$INSTALLED_CATALOG" && ! -L "$INSTALLED_CATALOG" && -d "$CATALOG_BACKUP" && ! -L "$CATALOG_BACKUP" ]]; then
+        /bin/mv "$CATALOG_BACKUP" "$INSTALLED_CATALOG" 2>/dev/null || \
+            print -u2 "Catalog rollback failed; the previous catalog remains at $CATALOG_BACKUP"
+    fi
+}
+abort_catalog_transaction() {
+    cleanup_catalog_transaction
+    trap - EXIT HUP INT TERM
+    exit 130
+}
+trap cleanup_catalog_transaction EXIT
+trap abort_catalog_transaction HUP INT TERM
+
+for app_plist in "${app_plists[@]}"; do
+    destination="$CATALOG_STAGING/${app_plist:t}"
+    source_digest_before="$(/usr/bin/shasum -a 256 "$app_plist" | /usr/bin/awk '{print $1}')"
+    temporary="$(/usr/bin/mktemp "$CATALOG_STAGING/.catalog.XXXXXXXX")"
+    /bin/cp "$app_plist" "$temporary"
+    /bin/chmod 600 "$temporary"
+    /usr/bin/plutil -lint "$temporary" >/dev/null
+    source_digest_after="$(/usr/bin/shasum -a 256 "$app_plist" | /usr/bin/awk '{print $1}')"
+    copied_digest="$(/usr/bin/shasum -a 256 "$temporary" | /usr/bin/awk '{print $1}')"
+    if [[ "$source_digest_before" != "$source_digest_after" || "$source_digest_before" != "$copied_digest" ]]; then
+        print -u2 "Catalog changed while being staged: $app_plist"
+        exit 1
+    fi
+    /bin/mv -f "$temporary" "$destination"
+done
+
+IOS_AUTO_REFRESH_ROOT="$INSTALL_ROOT" IOS_AUTO_REFRESH_CATALOG_DIR="$CATALOG_STAGING" \
+    "$INSTALLED_WORKER" --all --validate >/dev/null || {
+        print -u2 "Staged catalog revalidation failed; the installed catalog and LaunchAgent were not changed."
+        exit 1
+    }
+
+if [[ -d "$INSTALLED_CATALOG" ]]; then
+    CATALOG_BACKUP="$(/usr/bin/mktemp -d "$CATALOG_PARENT/.apps.d.previous.XXXXXXXX")"
+    /bin/rmdir "$CATALOG_BACKUP"
+    /bin/mv "$INSTALLED_CATALOG" "$CATALOG_BACKUP"
+fi
+if ! /bin/mv "$CATALOG_STAGING" "$INSTALLED_CATALOG"; then
+    print -u2 "Could not activate the staged catalog; rolling back."
+    exit 1
+fi
+CATALOG_STAGING=""
+trap - EXIT HUP INT TERM
+
+if [[ -n "$CATALOG_BACKUP" ]]; then
+    backup_clean=1
+    for previous_item in "$CATALOG_BACKUP"/*(N); do
+        if [[ -f "$previous_item" && ! -L "$previous_item" ]]; then
+            /bin/rm -f "$previous_item" || backup_clean=0
+        else
+            backup_clean=0
+        fi
+    done
+    if (( backup_clean == 1 )) && /bin/rmdir "$CATALOG_BACKUP" 2>/dev/null; then
+        CATALOG_BACKUP=""
+    else
+        print -u2 "The previous private catalog was retained for inspection at $CATALOG_BACKUP"
+    fi
+fi
+
+temporary_plist="$(/usr/bin/mktemp "$HOME/Library/LaunchAgents/.$LABEL.XXXXXXXX")"
+trap '/bin/rm -f "$temporary_plist"' EXIT
+/usr/bin/plutil -create xml1 "$temporary_plist"
+/usr/bin/plutil -insert Label -string "$LABEL" "$temporary_plist"
+/usr/bin/plutil -insert ProgramArguments -array "$temporary_plist"
+/usr/bin/plutil -insert ProgramArguments.0 -string "$INSTALLED_WORKER" "$temporary_plist"
+/usr/bin/plutil -insert ProgramArguments.1 -string '--all' "$temporary_plist"
+/usr/bin/plutil -insert WorkingDirectory -string "$FINAL_RUNTIME" "$temporary_plist"
+/usr/bin/plutil -insert RunAtLoad -bool true "$temporary_plist"
+/usr/bin/plutil -insert ProcessType -string Background "$temporary_plist"
+/usr/bin/plutil -insert ThrottleInterval -integer 300 "$temporary_plist"
+/usr/bin/plutil -insert LowPriorityIO -bool true "$temporary_plist"
+/usr/bin/plutil -insert Nice -integer 10 "$temporary_plist"
+/usr/bin/plutil -insert Umask -integer 63 "$temporary_plist"
+/usr/bin/plutil -insert StandardOutPath -string /dev/null "$temporary_plist"
+/usr/bin/plutil -insert StandardErrorPath -string /dev/null "$temporary_plist"
+/usr/bin/plutil -insert StartCalendarInterval -array "$temporary_plist"
+for index minute in 0 2 1 17 2 32 3 47; do
+    /usr/bin/plutil -insert "StartCalendarInterval.$index" -dictionary "$temporary_plist"
+    /usr/bin/plutil -insert "StartCalendarInterval.$index.Minute" -integer "$minute" "$temporary_plist"
+done
+/usr/bin/plutil -lint "$temporary_plist" >/dev/null
+/bin/chmod 600 "$temporary_plist"
+/bin/mv -f "$temporary_plist" "$DESTINATION_PLIST"
+trap - EXIT
+
+if (( NO_LOAD == 1 )); then
+    print "iOS Auto Refresh files installed without loading the LaunchAgent."
+    print "LaunchAgent: $DESTINATION_PLIST"
+    exit 0
+fi
+
+"$LAUNCHCTL" bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+"$LAUNCHCTL" bootstrap "$DOMAIN" "$DESTINATION_PLIST"
+"$LAUNCHCTL" enable "$DOMAIN/$LABEL"
+"$LAUNCHCTL" print "$DOMAIN/$LABEL" >/dev/null || {
+    print -u2 "LaunchAgent bootstrap returned without a loaded job."
+    exit 1
+}
+
+print "iOS Auto Refresh installed for ${#app_plists} catalog entry or entries."
+print "LaunchAgent: $DESTINATION_PLIST"
+print "Status: $INSTALLED_WORKER --all --status"
